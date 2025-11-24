@@ -2,7 +2,7 @@ import { Globals } from './configs/globals.js';
 import { jsonResponse } from './utils/http-util.js';
 import { log, formatLogMessage } from './utils/log-util.js'
 import { getRedisCaches, judgeRedisValid } from "./utils/redis-util.js";
-import { cleanupExpiredIPs, findUrlById, getCommentCache } from "./utils/cache-util.js";
+import { cleanupExpiredIPs, findUrlById, getCommentCache, getLocalCaches, judgeLocalCacheValid } from "./utils/cache-util.js";
 import { formatDanmuResponse } from "./utils/danmu-util.js";
 import { getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
 
@@ -16,12 +16,18 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   let path = url.pathname;
   const method = req.method;
 
+  if (deployPlatform === "node") {
+    await judgeLocalCacheValid(path, deployPlatform);
+  }
   await judgeRedisValid(path);
 
   log("info", `request url: ${JSON.stringify(url)}`);
   log("info", `request path: ${path}`);
   log("info", `client ip: ${clientIp}`);
 
+  if (deployPlatform === "node" && globals.localCacheValid && path !== "/favicon.ico" && path !== "/robots.txt") {
+    await getLocalCaches();
+  }
   if (globals.redisValid && path !== "/favicon.ico" && path !== "/robots.txt") {
     await getRedisCaches();
   }
@@ -33,6 +39,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       version: globals.VERSION,
       envs: {
         ...globals.accessedEnvVars,
+        localCacheValid: globals.localCacheValid,
         redisValid: globals.redisValid
       },
       repository: "https://github.com/huangxd-/danmu_api.git",
@@ -46,8 +53,15 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     return handleHomepage();
   }
 
-  if (path === "/favicon.ico" || path === "/robots.txt") {
-    return new Response(null, { status: 204 });
+  if (path === "/favicon.ico" || path === "/robots.txt" || method === "OPTIONS") {
+    return new Response(null, {
+        status: 204,
+        headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, User-Agent"
+        }
+    });
   }
 
   // --- 校验 token ---
