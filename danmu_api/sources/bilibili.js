@@ -8,7 +8,7 @@ import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { titleMatches } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 import { simplized } from "../utils/zh-util.js";
-import { getTmdbJaOriginalTitle } from "../utils/tmdb-util.js";
+import { getTmdbJaOriginalTitle, smartTitleReplace } from "../utils/tmdb-util.js";
 
 // =====================
 // 获取b站弹幕
@@ -205,10 +205,20 @@ export default class BilibiliSource extends BaseSource {
           .replace(/:/g, '：')
           .trim();
 
+		// 清洗原标题
+        const cleanedOrgTitle = (item.org_title || "")
+          .replace(/<[^>]+>/g, '')
+          .replace(/&[^;]+;/g, match => {
+            const entities = { '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"', '&#39;': "'" };
+            return entities[match] || match;
+          })
+          .trim();
+
         const resultItem = {
           provider: "bilibili",
           mediaId,
           title: cleanedTitle,
+		  org_title: cleanedOrgTitle,
           type: mediaType,
           year,
           imageUrl: item.cover || null,
@@ -424,9 +434,13 @@ export default class BilibiliSource extends BaseSource {
       return [];
     }
 
+    // 应用tmdb智能标题替换
+    const cnAlias = sourceAnimes.length > 0 ? sourceAnimes[0]._tmdbCnAlias : null;
+    smartTitleReplace(sourceAnimes, cnAlias);
+
     const processPromises = sourceAnimes
       // 港澳台资源不做严格标题匹配，因为可能搜到的是日语/繁体标题
-      .filter(anime => anime.isOversea || titleMatches(anime.title, queryTitle))
+      .filter(anime => anime.isOversea || titleMatches(anime.title, queryTitle)||(anime.org_title && titleMatches(anime.org_title, queryTitle)))
       .map(async (anime) => {
         try {
           let links = [];
@@ -493,10 +507,14 @@ export default class BilibiliSource extends BaseSource {
           if (links.length === 0) return;
 
           const numericAnimeId = convertToAsciiSum(anime.mediaId);
+          
+          // 优先使用tmdb智能标题替换的标题，否则对原标题进行繁转简处理
+          const displayTitle = anime._displayTitle || simplized(anime.title);
+
           const transformedAnime = {
             animeId: numericAnimeId,
             bangumiId: anime.mediaId,
-            animeTitle: `${anime.title}(${anime.year || 'N/A'})【${anime.type}】from bilibili`,
+            animeTitle: `${displayTitle}(${anime.year || 'N/A'})【${anime.type}】from bilibili`,
             type: anime.type,
             typeDescription: anime.type,
             imageUrl: anime.imageUrl,
@@ -821,14 +839,13 @@ export default class BilibiliSource extends BaseSource {
   }
 
   formatComments(comments) {
-    // 弹幕繁体转简体
-    if (globals.danmuSimplified) {
-        return comments.map(c => { 
-            if (c.m) c.m = simplized(c.m); 
-            return c; 
-        });
-    }
-    return comments;
+    return comments.map(c => {
+        if (globals.danmuSimplifiedTraditional === 'simplified') {
+            if (c.m) c.m = simplized(c.m);
+        }
+        c.like = c.like_num;
+        return c;
+    });
   }
 
   // 构建代理URL
@@ -856,7 +873,7 @@ export default class BilibiliSource extends BaseSource {
   }
 
   // 港澳台代理搜索请求
-  async _searchOverseaRequest(keyword, label="Original", signal = null) {
+  async _searchOverseaRequest(keyword, appType, webSearchType, label="Original", signal = null) {
     const rawCookie = globals.bilibliCookie || "";
     const akMatch = rawCookie.match(/([0-9a-fA-F]{32})/);
     const proxy = (globals.proxyUrl||'').includes('bilibili@') || (globals.proxyUrl||'').includes('@');
@@ -864,9 +881,9 @@ export default class BilibiliSource extends BaseSource {
 
     // 1. 尝试 App 接口
     if (akMatch) {
-        log("info", `[Bilibili-Proxy][${label}] 检测到 Access Key，启用 APP 端接口模式...`);
+        log("info", `[Bilibili-Proxy][${label}] 检测到 Access Key，启用 APP 端接口模式 (Type: ${appType})...`);
         try {
-            const params = { keyword, type: 7, area: 'tw', mobi_app: 'android', platform: 'android', build: '8140200', ts: Math.floor(Date.now()/1000), appkey: BilibiliSource.APP_KEY, access_key: akMatch[1], disable_rcmd: 1 };
+            const params = { keyword, type: appType, area: 'tw', mobi_app: 'android', platform: 'android', build: '8140200', ts: Math.floor(Date.now()/1000), appkey: BilibiliSource.APP_KEY, access_key: akMatch[1], disable_rcmd: 1 };
             const qs = Object.keys(params).sort().map(k => `${k}=${this._javaUrlEncode(String(params[k]))}`).join('&');
             const sign = md5(qs + BilibiliSource.APP_SEC);
             
@@ -876,13 +893,14 @@ export default class BilibiliSource extends BaseSource {
             const data = await this._fetchAppSearchWithStream(url, { "User-Agent": "Mozilla/5.0 Android", "X-From-Biliroaming": "1.0.0" }, label, signal);
             
             if (data && data.code === 0) {
-                return (data.data?.items || data.data || [])
+                // 兼容 items (影视/综艺) 和 result (番剧) 两种字段结构
+                return (data.data?.items || data.data?.result || data.data || [])
                     .filter(i => i.goto !== 'recommend_tips' && i.area !== '漫游' && i.badge !== '公告')
                     .map(i => ({
                         provider: "bilibili",
                         mediaId: i.season_id ? `ss${i.season_id}` : (i.uri.match(/season\/(\d+)/)?.[1] ? `ss${i.uri.match(/season\/(\d+)/)[1]}` : ""),
                         title: (i.title||"").replace(/<[^>]+>/g,'').trim(),
-                        type: "动漫",
+                        type: this._extractMediaType(i.season_type_name),
                         year: i.ptime ? new Date(i.ptime*1000).getFullYear() : null,
                         imageUrl: i.cover||i.pic||"",
                         episodeCount: 0,
@@ -898,12 +916,12 @@ export default class BilibiliSource extends BaseSource {
         }
         log("info", `[Bilibili-Proxy] App 接口请求失败，自动降级至 Web 接口...`);
     } else {
-        log("info", `[Bilibili-Proxy][${label}] 未检测到 Access Key，启用 Web 端接口模式...`);
+        log("info", `[Bilibili-Proxy][${label}] 未检测到 Access Key，启用 Web 端接口模式 (Type: ${webSearchType})...`);
     }
 
     // 2. Web 接口兜底
     try {
-        const params = { keyword, search_type: 'media_bangumi', area: 'tw', page: 1, order: 'totalrank', __refresh__: true, _timestamp: Date.now() };
+        const params = { keyword, search_type: webSearchType, area: 'tw', page: 1, order: 'totalrank', __refresh__: true, _timestamp: Date.now() };
         const qs = Object.keys(params).map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
         
         const target = `https://api.bilibili.com/x/web-interface/search/type?${qs}`;
@@ -936,8 +954,52 @@ export default class BilibiliSource extends BaseSource {
   // 综合港澳台搜索入口
   async _searchOversea(keyword) {
       const tmdbAbortController = new AbortController();
-      const t1 = this._searchOverseaRequest(keyword, "Original").then(r => { if(r.length) tmdbAbortController.abort(); return r; }).catch(()=>[]);
-      const t2 = globals.tmdbApiKey ? (new Promise(r=>setTimeout(r,100)).then(()=>getTmdbJaOriginalTitle(keyword, tmdbAbortController.signal, "Bilibili")).then(t => (t&&t!==keyword)?this._searchOverseaRequest(t,"TMDB",tmdbAbortController.signal):[]).catch(()=>[])) : Promise.resolve([]);
+      
+      // 定义搜索配置：同时搜索番剧(App:7, Web:media_bangumi)和影视(App:8, Web:media_ft)
+      const searchConfigs = [
+          { appType: 7, webType: 'media_bangumi' },
+          { appType: 8, webType: 'media_ft' }
+      ];
+      
+      // 1. 原始关键词搜索 (并发执行所有类型，增加间隔延迟)
+      const t1 = Promise.all(searchConfigs.map(async (conf, index) => {
+          if (index > 0) await new Promise(r => setTimeout(r, index * 300)); // 错峰请求避免风控
+          return this._searchOverseaRequest(keyword, conf.appType, conf.webType, "Original");
+      })).then(results => {
+          const flatResults = results.flat();
+          if(flatResults.length) tmdbAbortController.abort(); 
+          // 挂载原始 keyword
+          flatResults.forEach(i => i._originalQuery = keyword); 
+          return flatResults; 
+      }).catch(()=>[]);
+      
+      // 2. TMDB 辅助搜索
+      const t2 = globals.tmdbApiKey ? (new Promise(r=>setTimeout(r,100)).then(async ()=>{
+          // 获取 TMDB 原名及别名
+          const tmdbResult = await getTmdbJaOriginalTitle(keyword, tmdbAbortController.signal, "Bilibili");
+          
+          if (tmdbResult && tmdbResult.title && tmdbResult.title !== keyword) {
+             const { title: tmdbTitle, cnAlias } = tmdbResult;
+             
+             // 使用日语原名进行并发搜索 (包含番剧和影视，增加间隔延迟)
+             const tmdbPromises = searchConfigs.map(async (conf, index) => {
+                 if (index > 0) await new Promise(r => setTimeout(r, index * 300)); // 错峰请求避免风控
+                 return this._searchOverseaRequest(tmdbTitle, conf.appType, conf.webType, "TMDB", tmdbAbortController.signal);
+             });
+             
+             const results = (await Promise.all(tmdbPromises)).flat();
+             
+             // 注入上下文信息，包括别名
+             results.forEach(r => {
+                 r._originalQuery = keyword;
+                 r._searchUsedTitle = tmdbTitle;
+                 r._tmdbCnAlias = cnAlias; 
+             });
+             return results;
+          }
+          return [];
+      }).catch(()=>[])) : Promise.resolve([]);
+      
       return (await Promise.all([t1, t2])).flat();
   }
 
